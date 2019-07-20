@@ -2,10 +2,26 @@ extern crate lmdb_zero as lmdb;
 extern crate clap;
 use clap::{Arg, App};
 
+use std::fmt;
 use std::fs::File;
 use std::io::prelude::*;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+struct PresentableError(&'static str);
+impl fmt::Debug for PresentableError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(f, "Error: {}", self.0)
+    }
+}
+
+struct Config<'a> {
+    database_dir: &'a str,
+    database: Option<&'a str>,
+    list: bool,
+    extract: Option<&'a str>,
+    out_file: Option<&'a str>
+}
+
+fn main() -> Result<(), PresentableError> {
     let matches = App::new("lmdb-helper")
         .version("0.1")
         .author("Bibliofile <bibliofilegit@gmail.com>")
@@ -41,35 +57,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = dir.replace(r"\", "/");
     let dir = dir.trim_end_matches("/");
 
-    let env = unsafe {
-        let mut env = lmdb::EnvBuilder::new().unwrap();
-        env.set_maxdbs(16).unwrap();
-        env.open(dir, lmdb::open::RDONLY, 0o600)
-    }?;
-    let db = lmdb::Database::open(&env, matches.value_of("database"), &lmdb::DatabaseOptions::defaults())?;
+    let config = Config {
+        database_dir: dir,
+        database: matches.value_of("database"),
+        list: matches.is_present("list") || matches.value_of("extract").is_none(),
+        extract: matches.value_of("extract"),
+        out_file: matches.value_of("out"),
+    };
 
-    if matches.is_present("list") || matches.value_of("extract").is_none() {
+    run(&config)
+}
+
+fn run(config: &Config) -> Result<(), PresentableError> {
+    let db = get_database(config.database_dir, config.database)?;
+
+    if config.list {
         print_list(&db)?;
     }
 
-    if let Some(key) = matches.value_of("extract") {
-        extract_key(&db, key, matches.value_of("out").unwrap_or(&format!("{}.bin", key)))?;
+    if let Some(key) = config.extract {
+        extract_key(&db, key, config.out_file.unwrap_or(&format!("{}.bin", key)))?;
     }
 
     Ok(())
 }
 
+fn get_database(path: &str, database: Option<&str>) -> Result<lmdb::Database<'static>, PresentableError> {
+    let env = (unsafe {
+        let mut env = lmdb::EnvBuilder::new().unwrap();
+        env.set_maxdbs(2).unwrap();
+        env.open(path, lmdb::open::RDONLY, 0o600)
+    }).map_err(|_| PresentableError("Failed to open an environment. No database?"))?;
+
+    lmdb::Database::open(env, database, &lmdb::DatabaseOptions::defaults())
+        .map_err(|_| PresentableError("Failed to open database, does it exist?"))
+}
+
 /// Prints the keys in a database and the size of the values.
-fn print_list(db: &lmdb::Database) -> Result<(), lmdb::Error> {
-    let txn = lmdb::ReadTransaction::new(db.env())?;
+fn print_list(db: &lmdb::Database) -> Result<(), PresentableError> {
+    let txn = lmdb::ReadTransaction::new(db.env())
+        .map_err(|_| PresentableError("Failed to create read transaction"))?;
     let access = txn.access();
-    let mut cursor = txn.cursor(db)?;
+    let mut cursor = txn.cursor(db).map_err(|_| PresentableError("Failed to open a cursor"))?;
     let mut iter = lmdb::CursorIter::new(
         lmdb::MaybeOwned::Borrowed(&mut cursor),
         &access,
         |c, a| c.first(a),
         lmdb::Cursor::next::<str, [u8]>
-    )?;
+    ).map_err(|_| PresentableError("Failed to get an iterable cursor"))?;
 
     let mut key_width = 3;
     let mut val_width = 12;
@@ -80,6 +115,7 @@ fn print_list(db: &lmdb::Database) -> Result<(), lmdb::Error> {
         key_width = std::cmp::max(key_width, key.len());
         val_width = std::cmp::max(val_width, format!("{}", val.len()).len());
     }
+
     println!("| {:key_width$} | {:val_width$} |", "Key", "Size (bytes)", key_width=key_width, val_width=val_width);
     println!("| {} | {} |", "-".repeat(key_width), "-".repeat(val_width));
     for (key, len) in entries {
@@ -88,13 +124,17 @@ fn print_list(db: &lmdb::Database) -> Result<(), lmdb::Error> {
     Ok(())
 }
 
-fn extract_key(db: &lmdb::Database, key: &str, out_file: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let txn = lmdb::ReadTransaction::new(db.env())?;
+fn extract_key(db: &lmdb::Database, key: &str, out_file: &str) -> Result<(), PresentableError> {
+    let txn = lmdb::ReadTransaction::new(db.env())
+        .map_err(|_| PresentableError("Failed to create read transaction"))?;
     let access = txn.access();
-    let data: &[u8] = access.get(&db, key)?;
+    let data: &[u8] = access.get(&db, key)
+        .map_err(|_| PresentableError("Failed to get a value by key"))?;
 
-    let mut file = File::create(out_file)?;
-    file.write_all(data)?;
+    let mut file = File::create(out_file)
+        .map_err(|_| PresentableError("Failed to create the out file"))?;
+    file.write_all(data)
+        .map_err(|_| PresentableError("Failed to write to the out file"))?;
 
     Ok(())
 }
