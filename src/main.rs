@@ -18,6 +18,7 @@ struct Config<'a> {
     database: Option<&'a str>,
     list: bool,
     extract: Option<&'a str>,
+    extract_all: bool,
     out_file: Option<&'a str>
 }
 
@@ -42,6 +43,10 @@ fn main() -> Result<(), PresentableError> {
             .long("extract")
             .help("If passed, extract the value in the database to a file as specified by --out")
             .takes_value(true))
+        .arg(Arg::with_name("extract-all")
+            .long("extract-all")
+            .help("If passed, extract all keys from a database as <key>.bin")
+            .takes_value(false))
         .arg(Arg::with_name("out")
             .short("o")
             .long("out")
@@ -62,6 +67,7 @@ fn main() -> Result<(), PresentableError> {
         database: matches.value_of("database"),
         list: matches.is_present("list") || matches.value_of("extract").is_none(),
         extract: matches.value_of("extract"),
+        extract_all: matches.is_present("extract-all"),
         out_file: matches.value_of("out"),
     };
 
@@ -77,6 +83,10 @@ fn run(config: &Config) -> Result<(), PresentableError> {
 
     if let Some(key) = config.extract {
         extract_key(&db, key, config.out_file.unwrap_or(&format!("{}.bin", key)))?;
+    }
+
+    if config.extract_all {
+        extract_all(&db)?;
     }
 
     Ok(())
@@ -135,6 +145,28 @@ fn extract_key(db: &lmdb::Database, key: &str, out_file: &str) -> Result<(), Pre
         .map_err(|_| PresentableError("Failed to create the out file"))?;
     file.write_all(data)
         .map_err(|_| PresentableError("Failed to write to the out file"))?;
+
+    Ok(())
+}
+
+fn extract_all(db: &lmdb::Database) -> Result<(), PresentableError> {
+    let txn = lmdb::ReadTransaction::new(db.env())
+        .map_err(|_| PresentableError("Failed to create read transaction"))?;
+    let access = txn.access();
+    let mut cursor = txn.cursor(db).map_err(|_| PresentableError("Failed to open a cursor"))?;
+    let mut iter = lmdb::CursorIter::new(
+        lmdb::MaybeOwned::Borrowed(&mut cursor),
+        &access,
+        |c, a| c.first(a),
+        lmdb::Cursor::next::<str, [u8]>
+    ).map_err(|_| PresentableError("Failed to get an iterable cursor"))?;
+
+    while let Some(Ok((key, data))) = iter.next() {
+        let mut file = File::create(format!("{}.bin", key))
+            .map_err(|_| PresentableError("Failed to create the out file"))?;
+        file.write_all(data)
+            .map_err(|_| PresentableError("Failed to write to the out file"))?;
+    }
 
     Ok(())
 }
